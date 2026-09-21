@@ -47,6 +47,7 @@ def resolve_stats_path(path: str | None, run_dir: Path) -> str | None:
         if rebased.exists():
             return str(rebased.resolve())
     for resolved in (
+        run_dir / candidate,
         Path.cwd() / candidate,
         ROOT / candidate,
         ROOT / "configs" / "tasks" / run_dir.name / candidate,

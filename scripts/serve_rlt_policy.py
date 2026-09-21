@@ -82,7 +82,20 @@ class RLTInferenceModel(nnx.Module):
         dummy_prefix = jnp.zeros((1, prefix_seq_len, rlt_config.input_dim))
         dummy_mask = jnp.ones((1, prefix_seq_len), dtype=jnp.bool_)
         self.rlt_module.lazy_init(dummy_prefix, dummy_mask, rngs=rngs)
+        self._prefix_seq_len = int(prefix_seq_len)
         self.deterministic = True
+
+    def extract_image_prefix(self, rng: at.KeyArrayLike, observation: _model.Observation):
+        """Extract the fixed image-only VLA representation used by the RL token."""
+        return self.vla.extract_prefix_embeddings(rng, observation, train=False, image_only=True)
+
+    def encode_rl_tokens(self, prefix_embs: jnp.ndarray) -> jnp.ndarray:
+        """Encode prefix embeddings with static inference arguments."""
+        return self.rlt_module(prefix_embs, None, method="encode", train=False)
+
+    def decode_rl_tokens(self, rl_tokens: jnp.ndarray) -> jnp.ndarray:
+        """Decode to the model's fixed image-prefix sequence length."""
+        return self.rlt_module(rl_tokens, self._prefix_seq_len, method="decode", train=False)
 
     def infer(self, rng: at.KeyArrayLike, observation: _model.Observation) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Run inference. Supports any batch size.
@@ -94,6 +107,10 @@ class RLTInferenceModel(nnx.Module):
         if self.shared_prefix_inference:
             return self._infer_shared_prefix(rng, observation)
         return self._infer_legacy(rng, observation)
+
+    def encode_rl_token(self, rng: at.KeyArrayLike, observation: _model.Observation) -> jnp.ndarray:
+        prefix_embs, _ = self.extract_image_prefix(rng, observation)
+        return self.encode_rl_tokens(prefix_embs.astype(jnp.float32))
 
     def _infer_legacy(self, rng: at.KeyArrayLike, observation: _model.Observation) -> tuple[jnp.ndarray, jnp.ndarray]:
         prefix_embs, _ = self.vla.extract_prefix_embeddings(rng, observation, train=False, image_only=True)
@@ -134,11 +151,17 @@ class RLTPolicy(_base_policy.BasePolicy):
         transforms: Sequence[_transforms.DataTransformFn] = (),
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         metadata: dict[str, Any] | None = None,
+        proprio_dim: int = PROPRIO_DIM,
+        chunk_len: int = CHUNK_LEN,
+        action_dim: int = ACTION_DIM,
     ):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._metadata = metadata or {}
+        self._proprio_dim = int(proprio_dim)
+        self._chunk_len = int(chunk_len)
+        self._action_dim = int(action_dim)
         self._rng = rng or jax.random.key(0)
         self._infer_fn = nnx_utils.module_jit(model.infer)
 
@@ -150,6 +173,7 @@ class RLTPolicy(_base_policy.BasePolicy):
 
     def _infer_single(self, obs: dict) -> dict:
         """Single observation inference (original behavior)."""
+        raw_proprio = np.asarray(obs["state"], dtype=np.float32).reshape(-1)
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -164,6 +188,7 @@ class RLTPolicy(_base_policy.BasePolicy):
             actions=np.asarray(actions[0]),
             rl_token=np.asarray(rl_token[0]),
             state=np.asarray(inputs["state"])[0],
+            raw_proprio=raw_proprio,
             infer_time=infer_time,
         )
 
@@ -192,7 +217,9 @@ class RLTPolicy(_base_policy.BasePolicy):
 
         # Step 1: Apply input_transform to each observation individually
         transformed_list = []
+        raw_proprios = []
         for obs in obs_list:
+            raw_proprios.append(np.asarray(obs["state"], dtype=np.float32).reshape(-1))
             inp = jax.tree.map(lambda x: x, obs)
             inp = self._input_transform(inp)
             transformed_list.append(inp)
@@ -226,6 +253,7 @@ class RLTPolicy(_base_policy.BasePolicy):
                 actions=actions_np[i],
                 rl_token=rl_token_np[i],
                 state=states_np[i],
+                raw_proprio=raw_proprios[i],
                 infer_time=infer_time / real_batch_size,
             )
             results.append(result)
@@ -243,6 +271,7 @@ class RLTPolicy(_base_policy.BasePolicy):
         actions: np.ndarray,
         rl_token: np.ndarray,
         state: np.ndarray,
+        raw_proprio: np.ndarray,
         infer_time: float,
     ) -> dict:
         """Build output dict for one sample."""
@@ -262,13 +291,13 @@ class RLTPolicy(_base_policy.BasePolicy):
         z_rl = rl_token_flat
 
         # proprio
-        proprio = np.zeros(PROPRIO_DIM, dtype=np.float32)
-        n = min(PROPRIO_DIM, raw_state.shape[0])
-        proprio[:n] = raw_state[:n].astype(np.float32)
+        proprio = np.zeros(self._proprio_dim, dtype=np.float32)
+        n = min(self._proprio_dim, raw_proprio.shape[0])
+        proprio[:n] = raw_proprio[:n].astype(np.float32)
 
         # ref_chunk
         vla_actions = outputs["actions"]
-        ref_chunk = vla_actions[:CHUNK_LEN, :ACTION_DIM].astype(np.float32)
+        ref_chunk = vla_actions[: self._chunk_len, : self._action_dim].astype(np.float32)
 
         return {
             "z_rl": z_rl,
@@ -322,6 +351,18 @@ def load_rlt_model(
     return model
 
 
+def _create_checkpoint_data_config(config: _config.TrainConfig, checkpoint_path: pathlib.Path):
+    data_factory = config.data
+    asset_id = data_factory.assets.asset_id
+    checkpoint_assets_dir = checkpoint_path / "assets"
+    if asset_id is not None and (checkpoint_assets_dir / asset_id).is_dir():
+        data_factory = dataclasses.replace(
+            data_factory,
+            assets=dataclasses.replace(data_factory.assets, assets_dir=str(checkpoint_assets_dir)),
+        )
+    return data_factory.create(config.assets_dirs, config.model)
+
+
 @dataclasses.dataclass
 class Args:
     config: str = "rlt_pi05_agilexbag_image"
@@ -344,8 +385,12 @@ def main(args: Args) -> None:
         shared_prefix_inference=args.shared_prefix_inference,
     )
 
-    data_config = config.data.create(config.assets_dirs, config.model)
     checkpoint_path = pathlib.Path(args.checkpoint_dir)
+    data_config = _create_checkpoint_data_config(config, checkpoint_path)
+    policy_metadata = config.policy_metadata or {}
+    proprio_dim = int(policy_metadata.get("proprio_dim", PROPRIO_DIM))
+    chunk_len = int(policy_metadata.get("chunk_len", CHUNK_LEN))
+    action_dim = int(policy_metadata.get("action_dim", ACTION_DIM))
     norm_stats = None
     if data_config.asset_id is not None:
         try:
@@ -371,15 +416,18 @@ def main(args: Args) -> None:
         transforms=transforms_list,
         output_transforms=output_transforms,
         metadata={
-            **(config.policy_metadata or {}),
+            **policy_metadata,
             "has_rl_token": True,
-            "z_dim": 2048,
-            "proprio_dim": PROPRIO_DIM,
-            "chunk_len": CHUNK_LEN,
-            "action_dim": ACTION_DIM,
+            "z_dim": (config.rlt_num_tokens or 1) * (config.rlt_embed_dim or 2048),
+            "proprio_dim": proprio_dim,
+            "chunk_len": chunk_len,
+            "action_dim": action_dim,
             "supports_batch": True,
             "shared_prefix_inference": args.shared_prefix_inference,
         },
+        proprio_dim=proprio_dim,
+        chunk_len=chunk_len,
+        action_dim=action_dim,
     )
 
     # Test single inference
@@ -387,7 +435,7 @@ def main(args: Args) -> None:
     fake_obs = config.model.fake_obs(batch_size=1)
     fake_dict = {
         "images": {k: np.asarray(v[0]) for k, v in fake_obs.images.items()},
-        "state": np.zeros(PROPRIO_DIM, dtype=np.float32),
+        "state": np.zeros(proprio_dim, dtype=np.float32),
         "prompt": "test prompt",
     }
     try:

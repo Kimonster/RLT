@@ -269,3 +269,51 @@ def test_delta_chunk_normalization_broadcasts_batched_state0(tmp_path) -> None:
         dtype=np.float32,
     )
     assert np.allclose(restored, chunk_abs, atol=1e-5)
+
+
+def test_delta_chunk_supports_fourteen_joint_dimensions_and_slices_stats(tmp_path) -> None:
+    stats_path = tmp_path / "norm_stats_32d.json"
+    stats_path.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "actions": {
+                        "q01": [-1.0] * 32,
+                        "q99": [1.0] * 32,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = RLTOnlineRLConfig(
+        action_dim=16,
+        chunk_len=4,
+        proprio_dim=16,
+        action_representation="delta_chunk",
+        action_norm_stats_path=str(stats_path),
+        delta_action_dims=14,
+    )
+    adapter = ActionRepresentationAdapter.from_config(cfg)
+    assert adapter is not None
+    assert adapter.stats.q01.shape == (16,)
+    assert adapter.stats.q99.shape == (16,)
+
+    rng = np.random.default_rng(0)
+    state0 = rng.normal(size=(3, cfg.proprio_dim)).astype(np.float32)
+    chunk_abs = rng.normal(size=(3, cfg.chunk_len, cfg.action_dim)).astype(np.float32)
+    normalized = adapter.normalize_chunk(chunk_abs, state0)
+    restored = np.asarray(
+        jax.device_get(
+            jax_denormalize_to_abs_chunk(
+                jax.numpy.asarray(normalized),
+                jax.numpy.asarray(state0),
+                jax.numpy.asarray(adapter.stats.q01),
+                jax.numpy.asarray(adapter.stats.q99),
+                action_representation=cfg.action_representation,
+                delta_action_dims=cfg.delta_action_dims,
+            )
+        ),
+        dtype=np.float32,
+    )
+    assert np.allclose(restored, chunk_abs, atol=1e-5)

@@ -22,9 +22,11 @@ class RLTOnlineRLConfig:
     proprio_dim: int = 7
     action_representation: Literal["abs", "delta_chunk"] = "abs"
     action_norm_stats_path: str | None = None
+    delta_action_dims: int = 6
 
     gamma: float = 0.99
     fixed_std: float = 0.05
+    target_actor_deterministic: bool = False
     reference_dropout_prob: float = 0.5
     warmup_bc_weight: float = 1.0
     warmup_q_weight: float = 1.0
@@ -34,6 +36,9 @@ class RLTOnlineRLConfig:
 
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
+    # A positive value parameterizes the policy as
+    # ref_chunk + scale * tanh(residual).  Zero preserves legacy checkpoints.
+    actor_residual_scale: float = 0.0
     critic_hidden_dim: int = 256
     critic_num_layers: int = 2
 

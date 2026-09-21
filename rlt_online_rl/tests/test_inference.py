@@ -247,8 +247,8 @@ def test_inference_default_uses_actor_mean_without_dropout(tmp_path) -> None:
         request_id="req-2",
         episode_id=1,
         step_id=0,
-        deterministic=True,
     )
+    assert request.deterministic
     response = service.infer(request)
     wrapper = RLTPolicyInferenceWrapper(cfg)
     expected = wrapper.infer(

@@ -1,0 +1,96 @@
+experiment:
+  rl:
+    action_dim: 16
+    chunk_len: 50
+    z_dim: 2048
+    proprio_dim: 16
+    action_representation: delta_chunk
+    action_norm_stats_path: /mnt/pfs/kk/kk/ckpt/geniesim3/spatialpi05/assets/norm_stats.json
+    delta_action_dims: 14
+
+    gamma: 0.99
+    fixed_std: 0.05
+    target_actor_deterministic: true
+    reference_dropout_prob: 0.0
+    delta_weight: 100.0
+    warmup_bc_weight: 10.0
+    warmup_q_weight: 0.001
+    online_bc_weight: 5.0
+    online_q_weight: 0.001
+
+    actor_hidden_dim: 256
+    actor_num_layers: 2
+    actor_residual_scale: 0.05
+    critic_hidden_dim: 256
+    critic_num_layers: 2
+
+    actor_lr: 0.0001
+    critic_lr: 0.0001
+    target_tau: 0.005
+    actor_update_period: 2
+
+    warmup_min_size: 1000
+    warmup_post_collect_updates: 10000
+    freeze_after_warmup: false
+    grad_updates_per_cycle: 5
+
+runtime:
+  role: all
+  local_debug_mode: false
+
+  monitoring:
+    enable_wandb: false
+    wandb_project: rlt-geniesim-stack-three-blocks
+    wandb_entity: null
+    wandb_mode: offline
+    wandb_run_name: geniesim_stack_three_blocks
+    wandb_dir: ./runs/geniesim_stack_three_blocks/wandb
+
+  actor_service:
+    pull_params_interval_sec: 0.25
+    rpc_timeout_sec: 0.2
+    bind_host: 127.0.0.1
+    port: 9101
+    snapshot_path: ./runs/geniesim_stack_three_blocks/actor_snapshot/actor_snapshot.pkl
+    xla_mem_fraction: 0.10
+    xla_preallocate: false
+
+  learner_service:
+    push_actor_interval_steps: 500
+    checkpoint_interval_steps: 1000
+    sample_batch_size: 128
+    checkpoint_dir: ./runs/geniesim_stack_three_blocks/checkpoints
+    actor_snapshot_path: ./runs/geniesim_stack_three_blocks/actor_snapshot/actor_snapshot.pkl
+    replay_url: http://127.0.0.1:9102
+    poll_interval_sec: 0.01
+    xla_mem_fraction: 0.75
+    xla_preallocate: false
+
+  replay:
+    capacity: 200000
+    journal_path: ./runs/geniesim_stack_three_blocks/replay/replay_journal.pkl
+    bind_host: 127.0.0.1
+    port: 9102
+    seed: 0
+
+  env_driver:
+    machine_a_ws_url: ws://127.0.0.1:8000
+    actor_service_url: http://127.0.0.1:9101
+    replay_service_url: http://127.0.0.1:9102
+    task_mode: full_task
+    episode_start_control_mode: policy
+    # Independent per-timestep exploration noise is unsafe for deployment and
+    # makes a 50-step chunk visibly jitter. Enable stochastic sampling only in
+    # an explicitly supervised data-collection config.
+    actor_deterministic: true
+    chunk_exec_horizon: 10
+    control_frequency_hz: 20.0
+    step_trace_stride: 0
+    replay_feature_batch_size: 8
+    enable_human_override: false
+    safe_fallback_to_ref: true
+    machine_a_connect_timeout_sec: 5.0
+    machine_a_recv_timeout_sec: 30.0
+    machine_a_retry_interval_sec: 0.5
+    actor_request_timeout_sec: 2.0
+    replay_request_timeout_sec: 30.0

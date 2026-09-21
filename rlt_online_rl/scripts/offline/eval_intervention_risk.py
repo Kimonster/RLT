@@ -57,6 +57,7 @@ def _build_models(rl_config) -> tuple[ChunkActor, TwinCritic]:
         hidden_dim=rl_config.actor_hidden_dim,
         num_layers=rl_config.actor_num_layers,
         fixed_std=rl_config.fixed_std,
+        residual_scale=rl_config.actor_residual_scale,
     )
     critic = TwinCritic(
         z_dim=rl_config.z_dim,

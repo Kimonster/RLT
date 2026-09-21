@@ -73,6 +73,7 @@ def _make_networks(rl_config: RLTOnlineRLConfig) -> tuple[ChunkActor, TwinCritic
         hidden_dim=rl_config.actor_hidden_dim,
         num_layers=rl_config.actor_num_layers,
         fixed_std=rl_config.fixed_std,
+        residual_scale=rl_config.actor_residual_scale,
     )
     critic = TwinCritic(
         z_dim=rl_config.z_dim,
@@ -155,6 +156,7 @@ def update_critic(
             batch["next_ref_chunk"],
             rl_config.gamma,
             critic_rng,
+            target_actor_deterministic=rl_config.target_actor_deterministic,
         )
 
     (critic_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.critic_params)
@@ -195,19 +197,16 @@ def update_actor(
             batch["ref_chunk"],
             rl_config.reference_dropout_prob,
         )
-        action_chunk = actor.sample_action(
-            actor_params,
-            sample_rng,
-            batch["z_rl"],
-            batch["proprio"],
-            dropped_ref,
-            deterministic=False,
+        # Explore for the Q term, while supervising the deterministic policy used at deployment.
+        action_mean, action_std = actor.actor_dist(actor_params, batch["z_rl"], batch["proprio"], dropped_ref)
+        sampled_action = action_mean + action_std * jax.random.normal(
+            sample_rng, action_mean.shape, dtype=action_mean.dtype
         )
-        q1, _ = critic.q_values(
+        q1, q2 = critic.q_values(
             state.critic_params,
             batch["z_rl"],
             batch["proprio"],
-            action_chunk,
+            sampled_action,
         )
         source_chunk = batch["source_chunk"]
         human_mask = jnp.logical_or(
@@ -217,23 +216,24 @@ def update_actor(
         human_mask_f = human_mask.astype(jnp.float32)
         policy_mask_f = 1.0 - human_mask_f
         bc_target = jnp.where(human_mask[..., None], batch["action_chunk"], batch["ref_chunk"])
-        bc_error = jnp.mean(jnp.square(action_chunk - bc_target), axis=-1)
-        ref_error = jnp.mean(jnp.square(action_chunk - batch["ref_chunk"]), axis=-1)
-        human_error = jnp.mean(jnp.square(action_chunk - batch["action_chunk"]), axis=-1)
+        bc_error = jnp.mean(jnp.square(action_mean - bc_target), axis=-1)
+        ref_error = jnp.mean(jnp.square(action_mean - batch["ref_chunk"]), axis=-1)
+        human_error = jnp.mean(jnp.square(action_mean - batch["action_chunk"]), axis=-1)
         bc_penalty = jnp.mean(bc_error)
         bc_ref_penalty = jnp.sum(ref_error * policy_mask_f) / jnp.maximum(jnp.sum(policy_mask_f), 1.0)
         bc_human_penalty = jnp.sum(human_error * human_mask_f) / jnp.maximum(jnp.sum(human_mask_f), 1.0)
         human_mask_ratio = jnp.mean(human_mask_f)
         if not use_action_adapter:
-            pred_abs_chunk = action_chunk
+            pred_abs_chunk = action_mean
             target_abs_chunk = bc_target
         else:
             pred_abs_chunk = jax_denormalize_to_abs_chunk(
-                action_chunk,
+                action_mean,
                 batch["proprio"],
                 action_q01,
                 action_q99,
                 action_representation=rl_config.action_representation,
+                delta_action_dims=rl_config.delta_action_dims,
             )
             target_abs_chunk = jax_denormalize_to_abs_chunk(
                 bc_target,
@@ -241,11 +241,13 @@ def update_actor(
                 action_q01,
                 action_q99,
                 action_representation=rl_config.action_representation,
+                delta_action_dims=rl_config.delta_action_dims,
             )
-        pred_step_delta = pred_abs_chunk[:, 1:, :6] - pred_abs_chunk[:, :-1, :6]
-        target_step_delta = target_abs_chunk[:, 1:, :6] - target_abs_chunk[:, :-1, :6]
+        dims = rl_config.delta_action_dims
+        pred_step_delta = pred_abs_chunk[:, 1:, :dims] - pred_abs_chunk[:, :-1, :dims]
+        target_step_delta = target_abs_chunk[:, 1:, :dims] - target_abs_chunk[:, :-1, :dims]
         delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
-        actor_q = jnp.mean(q1)
+        actor_q = jnp.mean(jnp.minimum(q1, q2))
         weighted_bc = jnp.asarray(bc_weight, dtype=jnp.float32) * bc_penalty
         weighted_q = jnp.asarray(q_weight, dtype=jnp.float32) * actor_q
         weighted_delta = jnp.asarray(delta_weight, dtype=jnp.float32) * delta_penalty

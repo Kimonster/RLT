@@ -3,7 +3,7 @@ import logging
 import multiprocessing
 import os
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import Any, Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.geniesim_rollout_dataset import GenieSimRolloutDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -60,6 +61,20 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class _MappedEpisodeDataset(Dataset[T_co]):
+    """Episode-disjoint index view over a complete LeRobot dataset."""
+
+    def __init__(self, dataset: Dataset[T_co], indices: np.ndarray):
+        self._dataset = dataset
+        self._indices = indices
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[int(self._indices[index.__index__()])]
+
+    def __len__(self) -> int:
+        return int(self._indices.shape[0])
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -136,19 +151,45 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if data_config.rollout_root is not None:
+        return GenieSimRolloutDataset(data_config.rollout_root, cache_root=data_config.rollout_cache_root)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.dataset_root,
+        # See EpisodeSubsetDataset: keep raw episode ids intact for older
+        # LeRobot versions, then apply the fixed split through global indices.
+        episodes=None,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if data_config.dataset_episodes is not None:
+        dataset = _MappedEpisodeDataset(
+            dataset,
+            _episode_frame_indices(dataset, data_config.dataset_episodes),
+        )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
+
+def _episode_frame_indices(dataset: Any, episodes: Sequence[int]) -> np.ndarray:
+    episode_data_index = dataset.episode_data_index
+    starts = np.asarray(episode_data_index["from"])
+    ends = np.asarray(episode_data_index["to"])
+    indices: list[int] = []
+    for episode in episodes:
+        episode = int(episode)
+        if episode < 0 or episode >= len(starts):
+            raise IndexError(f"Episode index {episode} is outside dataset range")
+        indices.extend(range(int(starts[episode]), int(ends[episode])))
+    if not indices:
+        raise ValueError("Episode subset is empty")
+    return np.asarray(indices, dtype=np.int64)
 
 
 def create_rlds_dataset(

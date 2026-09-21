@@ -59,12 +59,13 @@ class ChunkActor:
     hidden_dim: int
     num_layers: int
     fixed_std: float
+    residual_scale: float = 0.0
 
     def init_params(self, rng: jax.Array) -> PyTree:
         z_key, proprio_key, ref_key, trunk_key = jax.random.split(rng, 4)
         input_dim = 256 + 64 + 256
         output_dim = self.chunk_len * self.action_dim
-        return {
+        params = {
             "z_proj": _init_linear_params(z_key, self.z_dim, 256),
             "proprio_proj": _init_linear_params(proprio_key, self.proprio_dim, 64),
             "ref_proj": _init_linear_params(ref_key, self.chunk_len * self.action_dim, 256),
@@ -72,6 +73,13 @@ class ChunkActor:
                 trunk_key, input_dim, _build_hidden_dims(self.hidden_dim, self.num_layers), output_dim
             ),
         }
+        if self.residual_scale > 0.0:
+            last = params["trunk"]["layers"][-1]
+            params["trunk"]["layers"] = (
+                *params["trunk"]["layers"][:-1],
+                {"w": jnp.zeros_like(last["w"]), "b": jnp.zeros_like(last["b"])},
+            )
+        return params
 
     def _encode_inputs(
         self,
@@ -96,8 +104,10 @@ class ChunkActor:
     ) -> jax.Array:
         batch_size = z_rl.shape[0]
         features = self._encode_inputs(params, z_rl, proprio, ref_chunk)
-        mu = _mlp_forward(params["trunk"], features)
-        return mu.reshape(batch_size, self.chunk_len, self.action_dim)
+        mu = _mlp_forward(params["trunk"], features).reshape(batch_size, self.chunk_len, self.action_dim)
+        if self.residual_scale > 0.0:
+            return ref_chunk + self.residual_scale * jnp.tanh(mu)
+        return mu
 
     def actor_dist(
         self,
@@ -235,6 +245,8 @@ def build_td_target(
     done: jax.Array,
     gamma: float,
     rng: jax.Array,
+    *,
+    target_actor_deterministic: bool = False,
 ) -> jax.Array:
     next_action = target_actor.sample_action(
         target_actor_params,
@@ -242,7 +254,7 @@ def build_td_target(
         next_z_rl,
         next_proprio,
         next_ref_chunk,
-        deterministic=False,
+        deterministic=target_actor_deterministic,
     )
     next_q1, next_q2 = target_critic.q_values(target_critic_params, next_z_rl, next_proprio, next_action)
     bootstrap = (1.0 - done.astype(rewards.dtype)) * (gamma ** rewards.shape[-1]) * jnp.minimum(next_q1, next_q2)
@@ -263,13 +275,18 @@ def compute_actor_loss(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     dropout_rng, sample_rng = jax.random.split(rng)
     dropped_ref = apply_reference_dropout(dropout_rng, ref_chunk, reference_dropout_prob)
-    action_chunk = actor.sample_action(actor_params, sample_rng, z_rl, proprio, dropped_ref, deterministic=False)
-    q1, _ = critic.q_values(critic_params, z_rl, proprio, action_chunk)
-    bc_penalty = jnp.mean(jnp.square(action_chunk - ref_chunk))
-    actor_loss = -jnp.mean(q1) + beta * bc_penalty
+    # Explore for the Q term, while supervising the deterministic policy used at deployment.
+    action_mean, action_std = actor.actor_dist(actor_params, z_rl, proprio, dropped_ref)
+    sampled_action = action_mean + action_std * jax.random.normal(
+        sample_rng, action_mean.shape, dtype=action_mean.dtype
+    )
+    q1, q2 = critic.q_values(critic_params, z_rl, proprio, sampled_action)
+    actor_q = jnp.mean(jnp.minimum(q1, q2))
+    bc_penalty = jnp.mean(jnp.square(action_mean - ref_chunk))
+    actor_loss = -actor_q + beta * bc_penalty
     metrics = {
         "actor_loss": actor_loss,
-        "actor_q": jnp.mean(q1),
+        "actor_q": actor_q,
         "bc_penalty": bc_penalty,
     }
     return actor_loss, metrics
@@ -291,6 +308,8 @@ def compute_critic_loss(
     next_ref_chunk: jax.Array,
     gamma: float,
     rng: jax.Array,
+    *,
+    target_actor_deterministic: bool = False,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     q1, q2 = critic.q_values(critic_params, z_rl, proprio, action_chunk)
     target_q = build_td_target(
@@ -305,6 +324,7 @@ def compute_critic_loss(
         done,
         gamma,
         rng,
+        target_actor_deterministic=target_actor_deterministic,
     )
     critic_loss = jnp.mean(jnp.square(q1 - target_q)) + jnp.mean(jnp.square(q2 - target_q))
     metrics = {

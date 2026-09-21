@@ -15,12 +15,16 @@ class QuantileStats:
     q99: np.ndarray
 
 
-def _load_quantile_stats(path: str) -> QuantileStats:
+def _load_quantile_stats(path: str, action_dim: int) -> QuantileStats:
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
     stats = payload["norm_stats"]["actions"]
     q01 = np.asarray(stats["q01"], dtype=np.float32)
     q99 = np.asarray(stats["q99"], dtype=np.float32)
+    if q01.shape[-1] < action_dim or q99.shape[-1] < action_dim:
+        raise ValueError(f"Action stats at {path} have fewer than {action_dim} dimensions")
+    q01 = q01[..., :action_dim]
+    q99 = q99[..., :action_dim]
     return QuantileStats(q01=q01, q99=q99)
 
 
@@ -63,11 +67,10 @@ def jax_quantile_denormalize(x: jnp.ndarray, q01: jnp.ndarray, q99: jnp.ndarray)
     return (jnp.asarray(x, dtype=jnp.float32) + 1.0) * 0.5 * scale + q01
 
 
-def jax_delta_to_abs_chunk(chunk_delta: jnp.ndarray, state0: jnp.ndarray) -> jnp.ndarray:
+def jax_delta_to_abs_chunk(chunk_delta: jnp.ndarray, state0: jnp.ndarray, delta_action_dims: int = 6) -> jnp.ndarray:
     chunk_delta = jnp.asarray(chunk_delta, dtype=jnp.float32)
     state0 = _broadcast_state0_jax(state0, chunk_delta)
-    chunk_abs = chunk_delta.at[..., :6].add(state0[..., :6])
-    return chunk_abs
+    return chunk_delta.at[..., :delta_action_dims].add(state0[..., :delta_action_dims])
 
 
 def jax_denormalize_to_abs_chunk(
@@ -77,11 +80,12 @@ def jax_denormalize_to_abs_chunk(
     q99: jnp.ndarray,
     *,
     action_representation: str,
+    delta_action_dims: int = 6,
 ) -> jnp.ndarray:
     chunk_repr = jax_quantile_denormalize(chunk_norm, q01, q99)
     if action_representation == "abs":
         return chunk_repr
-    return jax_delta_to_abs_chunk(chunk_repr, state0)
+    return jax_delta_to_abs_chunk(chunk_repr, state0, delta_action_dims)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,22 +97,26 @@ class ActionRepresentationAdapter:
     def from_config(cls, rl_config: RLTOnlineRLConfig) -> ActionRepresentationAdapter | None:
         if rl_config.action_norm_stats_path is None:
             return None
-        return cls(rl_config=rl_config, stats=_load_quantile_stats(rl_config.action_norm_stats_path))
+        return cls(
+            rl_config=rl_config,
+            stats=_load_quantile_stats(rl_config.action_norm_stats_path, rl_config.action_dim),
+        )
 
     def _abs_to_delta_chunk(self, chunk_abs: np.ndarray, state0: np.ndarray) -> np.ndarray:
         chunk_abs = np.asarray(chunk_abs, dtype=np.float32)
         state0 = _broadcast_state0(state0, chunk_abs)
         chunk_delta = chunk_abs.copy()
         zero_mask = _zero_row_mask(chunk_abs)
-        chunk_delta[..., :6] = chunk_abs[..., :6] - state0[..., :6]
-        chunk_delta = np.where(zero_mask, 0.0, chunk_delta)
-        return chunk_delta
+        dims = self.rl_config.delta_action_dims
+        chunk_delta[..., :dims] = chunk_abs[..., :dims] - state0[..., :dims]
+        return np.where(zero_mask, 0.0, chunk_delta)
 
     def _delta_to_abs_chunk(self, chunk_delta: np.ndarray, state0: np.ndarray) -> np.ndarray:
         chunk_delta = np.asarray(chunk_delta, dtype=np.float32)
         state0 = _broadcast_state0(state0, chunk_delta)
         chunk_abs = chunk_delta.copy()
-        chunk_abs[..., :6] = chunk_delta[..., :6] + state0[..., :6]
+        dims = self.rl_config.delta_action_dims
+        chunk_abs[..., :dims] = chunk_delta[..., :dims] + state0[..., :dims]
         return chunk_abs
 
     def _to_representation(self, chunk_abs: np.ndarray, state0: np.ndarray) -> np.ndarray:

@@ -56,7 +56,7 @@ class ActorRequest:
     request_id: str
     episode_id: int
     step_id: int
-    deterministic: bool = False
+    deterministic: bool = True
     timestamp: float | None = None
 
     def to_payload(self) -> dict[str, Any]:
@@ -231,6 +231,7 @@ class RLTPolicyInferenceWrapper:
             hidden_dim=rl_config.actor_hidden_dim,
             num_layers=rl_config.actor_num_layers,
             fixed_std=rl_config.fixed_std,
+            residual_scale=rl_config.actor_residual_scale,
         )
         self._compiled_mean = jax.jit(self._forward_mean)
         self._compiled_sample = jax.jit(self._forward_sample)
@@ -243,7 +244,7 @@ class RLTPolicyInferenceWrapper:
         ref_chunk: np.ndarray,
         *,
         rng: jax.Array | None = None,
-        deterministic: bool = False,
+        deterministic: bool = True,
     ) -> np.ndarray:
         z_rl = np.asarray(z_rl, dtype=np.float32)[None, ...]
         proprio = np.asarray(proprio, dtype=np.float32)[None, ...]
@@ -295,6 +296,7 @@ class ActorService:
         self._poll_thread: threading.Thread | None = None
         self._logged_missing_params = False
         self._packer = msgpack_numpy.Packer()
+        self._try_reload_snapshot()
         self._start_param_poller()
 
     def infer(self, request: ActorRequest) -> ActorResponse:
@@ -378,7 +380,7 @@ class ActorService:
                         request_id=str(payload["request_id"]),
                         episode_id=int(payload["episode_id"]),
                         step_id=int(payload["step_id"]),
-                        deterministic=bool(payload.get("deterministic", False)),
+                        deterministic=bool(payload.get("deterministic", True)),
                         timestamp=payload.get("timestamp"),
                     )
                 )
@@ -512,7 +514,7 @@ def maybe_refine_chunk(
     request_id: str,
     episode_id: int,
     step_id: int,
-    deterministic: bool = False,
+    deterministic: bool = True,
     on_error_fallback: bool = True,
 ) -> RefinementResult:
     try:

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pickle
 import random
+import shutil
 import sys
 from typing import Any
 
@@ -101,11 +102,20 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_snapshot_config(task_dir: Path) -> RLTOnlineRLConfig:
     snapshot_path = task_dir / "actor_snapshot" / "actor_snapshot.pkl"
-    with snapshot_path.open("rb") as f:
-        payload = pickle.load(f)
-    cfg = RLTOnlineRLConfig(**payload["rl_config"])
-    cfg = resolve_rl_config_paths(cfg, str(snapshot_path), require_exists=True)
-    return dataclasses.replace(cfg, action_norm_stats_path=resolve_stats_path(cfg.action_norm_stats_path, task_dir))
+    if snapshot_path.is_file():
+        with snapshot_path.open("rb") as f:
+            payload = pickle.load(f)
+        cfg = RLTOnlineRLConfig(**payload["rl_config"])
+        cfg = resolve_rl_config_paths(cfg, str(snapshot_path), require_exists=True)
+        return dataclasses.replace(cfg, action_norm_stats_path=resolve_stats_path(cfg.action_norm_stats_path, task_dir))
+
+    config_path = ROOT / "configs" / "tasks" / task_dir.name / "online_rl.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Neither an actor snapshot nor a task config exists for {task_dir}: {snapshot_path}, {config_path}"
+        )
+    system_config = load_system_config_yaml(str(config_path))
+    return resolve_rl_config_paths(system_config.rl, str(config_path), require_exists=True)
 
 
 def _load_replay_records(path: Path) -> list[dict[str, Any]]:
@@ -271,6 +281,22 @@ def _relativize_path(path_value: str | Path | None, anchor_path: Path) -> str | 
 def _portable_rl_config_dict(rl_config: RLTOnlineRLConfig, anchor_path: Path) -> dict[str, Any]:
     portable = relativize_rl_config_paths(rl_config, str(anchor_path))
     return dataclasses.asdict(portable)
+
+
+def _bundle_action_norm_stats(output_dir: Path, rl_config: RLTOnlineRLConfig) -> RLTOnlineRLConfig:
+    if rl_config.action_norm_stats_path is None:
+        return rl_config
+
+    source_path = Path(rl_config.action_norm_stats_path).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Action normalization stats do not exist: {source_path}")
+    target_path = (output_dir / "assets" / "norm_stats.json").resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path != target_path:
+        temporary_path = target_path.with_suffix(target_path.suffix + ".tmp")
+        shutil.copy2(source_path, temporary_path)
+        os.replace(temporary_path, target_path)
+    return dataclasses.replace(rl_config, action_norm_stats_path=str(target_path))
 
 
 def _save_actor_snapshot(path: Path, version: int, rl_config: RLTOnlineRLConfig, actor_params: PyTree) -> None:
@@ -464,6 +490,7 @@ def _custom_actor_loss(
     action_q01: jax.Array | None,
     action_q99: jax.Array | None,
     action_representation: str,
+    delta_action_dims: int,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     dropout_rng, sample_rng = jax.random.split(rng)
     if reference_dropout_prob > 0.0:
@@ -472,8 +499,12 @@ def _custom_actor_loss(
     else:
         dropped_ref = ref_chunk
     model_ref_input = jnp.zeros_like(dropped_ref) if disable_ref_input else dropped_ref
-    action_chunk = actor.sample_action(actor_params, sample_rng, z_rl, proprio, model_ref_input, deterministic=False)
-    q1, _ = critic.q_values(critic_params, z_rl, proprio, action_chunk)
+    # Explore for the Q term, while supervising the deterministic policy used at deployment.
+    action_mean, action_std = actor.actor_dist(actor_params, z_rl, proprio, model_ref_input)
+    sampled_action = action_mean + action_std * jax.random.normal(
+        sample_rng, action_mean.shape, dtype=action_mean.dtype
+    )
+    q1, q2 = critic.q_values(critic_params, z_rl, proprio, sampled_action)
     human_mask = jnp.logical_or(
         source_chunk == int(TransitionSource.HUMAN),
         source_chunk == int(TransitionSource.MIXED),
@@ -481,23 +512,24 @@ def _custom_actor_loss(
     human_mask_f = human_mask.astype(jnp.float32)
     policy_mask_f = 1.0 - human_mask_f
     bc_target = jnp.where(human_mask[..., None], behavior_chunk, ref_chunk)
-    bc_error = jnp.mean(jnp.square(action_chunk - bc_target), axis=-1)
-    ref_error = jnp.mean(jnp.square(action_chunk - ref_chunk), axis=-1)
-    human_error = jnp.mean(jnp.square(action_chunk - behavior_chunk), axis=-1)
+    bc_error = jnp.mean(jnp.square(action_mean - bc_target), axis=-1)
+    ref_error = jnp.mean(jnp.square(action_mean - ref_chunk), axis=-1)
+    human_error = jnp.mean(jnp.square(action_mean - behavior_chunk), axis=-1)
     bc_penalty = jnp.mean(bc_error)
     bc_ref_penalty = jnp.sum(ref_error * policy_mask_f) / jnp.maximum(jnp.sum(policy_mask_f), 1.0)
     bc_human_penalty = jnp.sum(human_error * human_mask_f) / jnp.maximum(jnp.sum(human_mask_f), 1.0)
     human_mask_ratio = jnp.mean(human_mask_f)
     if not use_action_adapter:
-        pred_abs_chunk = action_chunk
+        pred_abs_chunk = action_mean
         target_abs_chunk = bc_target
     else:
         pred_abs_chunk = jax_denormalize_to_abs_chunk(
-            action_chunk,
+            action_mean,
             proprio,
             action_q01,
             action_q99,
             action_representation=action_representation,
+            delta_action_dims=delta_action_dims,
         )
         target_abs_chunk = jax_denormalize_to_abs_chunk(
             bc_target,
@@ -505,11 +537,12 @@ def _custom_actor_loss(
             action_q01,
             action_q99,
             action_representation=action_representation,
+            delta_action_dims=delta_action_dims,
         )
-    pred_step_delta = pred_abs_chunk[:, 1:, :6] - pred_abs_chunk[:, :-1, :6]
-    target_step_delta = target_abs_chunk[:, 1:, :6] - target_abs_chunk[:, :-1, :6]
+    pred_step_delta = pred_abs_chunk[:, 1:, :delta_action_dims] - pred_abs_chunk[:, :-1, :delta_action_dims]
+    target_step_delta = target_abs_chunk[:, 1:, :delta_action_dims] - target_abs_chunk[:, :-1, :delta_action_dims]
     delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
-    actor_q = jnp.mean(q1)
+    actor_q = jnp.mean(jnp.minimum(q1, q2))
     weighted_bc = jnp.asarray(bc_weight, dtype=jnp.float32) * bc_penalty
     weighted_q = jnp.asarray(q_weight, dtype=jnp.float32) * actor_q
     weighted_delta = jnp.asarray(delta_weight, dtype=jnp.float32) * delta_penalty
@@ -526,6 +559,7 @@ def _custom_actor_loss(
         "weighted_bc": weighted_bc,
         "weighted_delta": weighted_delta,
         "weighted_q": weighted_q,
+        "effective_q_weight": jnp.asarray(q_weight, dtype=jnp.float32),
     }
     return actor_loss, metrics
 
@@ -538,6 +572,7 @@ def _update_critic(
     rl_config: RLTOnlineRLConfig,
     *,
     disable_ref_input: bool,
+    axis_name: str | None = None,
 ) -> tuple[RLTTrainState, dict[str, jax.Array]]:
     critic_rng, next_rng = jax.random.split(state.rng)
 
@@ -558,13 +593,18 @@ def _update_critic(
             jnp.zeros_like(batch["next_ref_chunk"]) if disable_ref_input else batch["next_ref_chunk"],
             rl_config.gamma,
             critic_rng,
+            target_actor_deterministic=rl_config.target_actor_deterministic,
         )
 
     (critic_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.critic_params)
+    if axis_name is not None:
+        grads = jax.lax.pmean(grads, axis_name)
     updates, critic_opt_state = state.critic_tx.update(grads, state.critic_opt_state, state.critic_params)
     critic_params = optax.apply_updates(state.critic_params, updates)
     new_state = state.replace(critic_params=critic_params, critic_opt_state=critic_opt_state, rng=next_rng)
     metrics = {**metrics, "critic_loss": critic_loss}
+    if axis_name is not None:
+        metrics = jax.lax.pmean(metrics, axis_name)
     return new_state, metrics
 
 
@@ -583,6 +623,7 @@ def _zero_metrics() -> dict[str, jax.Array]:
         "weighted_bc": nan,
         "weighted_delta": nan,
         "weighted_q": nan,
+        "effective_q_weight": nan,
     }
 
 
@@ -598,8 +639,10 @@ def _make_train_step(
     use_action_adapter: bool,
     action_q01: jax.Array | None,
     action_q99: jax.Array | None,
+    actor_q_start_step: int = 0,
+    axis_name: str | None = None,
+    devices: tuple[jax.Device, ...] | None = None,
 ):
-    @jax.jit
     def train_step(state: RLTTrainState, batch: dict[str, jax.Array]) -> tuple[RLTTrainState, dict[str, jax.Array]]:
         state_after_critic, critic_metrics = _update_critic(
             state,
@@ -608,11 +651,17 @@ def _make_train_step(
             critic,
             rl_config,
             disable_ref_input=disable_ref_input,
+            axis_name=axis_name,
         )
         should_update_actor = ((state_after_critic.global_step + 1) % rl_config.actor_update_period) == 0
 
         def do_actor_update(train_state: RLTTrainState) -> tuple[RLTTrainState, dict[str, jax.Array]]:
             actor_rng, next_rng = jax.random.split(train_state.rng)
+            effective_q_weight = jnp.where(
+                train_state.global_step + 1 >= actor_q_start_step,
+                jnp.asarray(q_weight, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
 
             def loss_fn(actor_params: PyTree) -> tuple[jax.Array, dict[str, jax.Array]]:
                 return _custom_actor_loss(
@@ -626,7 +675,7 @@ def _make_train_step(
                     batch["action_chunk"],
                     batch["source_chunk"],
                     bc_weight=bc_weight,
-                    q_weight=q_weight,
+                    q_weight=effective_q_weight,
                     delta_weight=delta_weight,
                     reference_dropout_prob=rl_config.reference_dropout_prob,
                     disable_ref_input=disable_ref_input,
@@ -635,9 +684,12 @@ def _make_train_step(
                     action_q01=action_q01,
                     action_q99=action_q99,
                     action_representation=rl_config.action_representation,
+                    delta_action_dims=rl_config.delta_action_dims,
                 )
 
             (actor_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.actor_params)
+            if axis_name is not None:
+                grads = jax.lax.pmean(grads, axis_name)
             updates, actor_opt_state = train_state.actor_tx.update(
                 grads, train_state.actor_opt_state, train_state.actor_params
             )
@@ -657,6 +709,8 @@ def _make_train_step(
                 actor_version=updated_state.actor_version + 1,
             )
             metrics = {**metrics, "actor_loss": actor_loss}
+            if axis_name is not None:
+                metrics = jax.lax.pmean(metrics, axis_name)
             return updated_state, metrics
 
         state_after_actor, actor_metrics = jax.lax.cond(
@@ -675,7 +729,9 @@ def _make_train_step(
         }
         return state_after_actor, metrics
 
-    return train_step
+    if axis_name is None:
+        return jax.jit(train_step)
+    return jax.pmap(train_step, axis_name=axis_name, devices=devices)
 
 
 def main() -> None:
@@ -702,6 +758,7 @@ def main() -> None:
         rl_config = dataclasses.replace(rl_config, critic_hidden_dim=args.critic_hidden_dim)
     if args.critic_num_layers is not None:
         rl_config = dataclasses.replace(rl_config, critic_num_layers=args.critic_num_layers)
+    rl_config = _bundle_action_norm_stats(output_dir, rl_config)
     records = filter_replay_records(
         _load_replay_records(replay_path),
         phase=args.phase,

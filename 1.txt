@@ -1,0 +1,3 @@
+SFT-trained pi05 model: /mnt/pfs/kk/kk/ckpt/geniesim3/spatialpi05
+
+first round rollout data(50 success, 100 failure): /mnt/pfs/kk/kk/data/data/geniesim/rollout/stack_three_blocks

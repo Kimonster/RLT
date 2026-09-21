@@ -23,6 +23,7 @@ import openpi.policies.agilexbag_image_policy as agilexbag_image_policy
 # import openpi.policies.agilexbag_policy as agilexbag_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.geniesim_policy as geniesim_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -39,6 +40,24 @@ Filter: TypeAlias = nnx.filterlib.Filter
 
 AGILEX_LEROBOT_REPO = os.environ.get("AGILEX_LEROBOT_REPO", "your_hf_username/agilex_ethernet_lerobot")
 AGILEX_PI05_BASE_CKPT = os.environ.get("AGILEX_PI05_BASE_CKPT", "gs://openpi-assets/checkpoints/pi05_base/params")
+GENIESIM_RLT_BASE_CKPT = os.environ.get(
+    "GENIESIM_RLT_BASE_CKPT", "/mnt/pfs/kk/kk/ckpt/geniesim3/spatialpi05"
+)
+GENIESIM_RLT_ROLLOUT_ROOT = os.environ.get(
+    "GENIESIM_RLT_ROLLOUT_ROOT", "/mnt/pfs/kk/kk/data/data/geniesim/rollout/stack_three_blocks"
+)
+GENIESIM_RLT_CACHE_ROOT = os.environ.get(
+    "GENIESIM_RLT_CACHE_ROOT", "/mnt/pfs/kk/kk/ckpt/RLT/geniesim_stack_three_blocks/cache_224"
+)
+GENIESIM_RLT_DEMO_ROOT = os.environ.get(
+    "GENIESIM_RLT_DEMO_ROOT", "/mnt/pfs/kk/kk/data/data/geniesim/stack_three_blocks"
+)
+GENIESIM_RLT_RUN_ROOT = os.environ.get(
+    "GENIESIM_RLT_RUN_ROOT", "/mnt/pfs/kk/kk/ckpt/RLT/geniesim_stack_three_blocks"
+)
+GENIESIM_RLT_PLAN_ROOT = os.environ.get(
+    "GENIESIM_RLT_PLAN_ROOT", "/mnt/pfs/kk/kk/ckpt/RLT/geniesim_stack_three_blocks_plan"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +91,13 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local root for a LeRobot dataset. If set, load this path directly.
+    dataset_root: str | None = None
+    # Optional fixed episode subset. This keeps train/validation splits episode-disjoint.
+    dataset_episodes: Sequence[int] | None = None
+    # Optional raw GenieSim rollout root and its preprocessed image cache.
+    rollout_root: str | None = None
+    rollout_cache_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -174,6 +200,9 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Optional local LeRobot dataset root and episode subset.
+    dataset_root: str | None = None
+    dataset_episodes: Sequence[int] | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -189,6 +218,8 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            dataset_root=self.dataset_root,
+            dataset_episodes=self.dataset_episodes,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -534,6 +565,77 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class GenieSimDemonstrationDataConfig(DataConfigFactory):
+    """Original SFT demonstration dataset for GenieSim stack-three-blocks."""
+
+    default_prompt: str = "Stacking Blocks-Large Blocks"
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "top_head": "observation.images.top_head",
+                            "hand_left": "observation.images.hand_left",
+                            "hand_right": "observation.images.hand_right",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+        delta_mask = _transforms.make_bool_mask(14, -2)
+        data_transforms = _transforms.Group(
+            inputs=[geniesim_policy.GenieSimInputs(), _transforms.DeltaActions(delta_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_mask)],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class GenieSimRolloutDataConfig(DataConfigFactory):
+    """Recorded GenieSim policy calls used for frozen-VLA RL-token training."""
+
+    rollout_root: str = tyro.MISSING
+    rollout_cache_root: str | None = None
+    default_prompt: str = "stack all the building blocks on the middle of the table"
+    output_action_dim: int = 16
+    delta_action_dims: int = 14
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        delta_mask = _transforms.make_bool_mask(
+            self.delta_action_dims,
+            -(self.output_action_dim - self.delta_action_dims),
+        )
+        data_transforms = _transforms.Group(
+            inputs=[geniesim_policy.GenieSimInputs()],
+            outputs=[geniesim_policy.GenieSimOutputs(action_dim=self.output_action_dim)],
+        ).push(
+            inputs=[_transforms.DeltaActions(delta_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_mask)],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            rollout_root=self.rollout_root,
+            rollout_cache_root=self.rollout_cache_root,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
         )
 
 
@@ -1140,6 +1242,91 @@ _CONFIGS = [
         num_train_steps=5000,
         exp_name="rlt_pi05",
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=0.0,
+    ),
+    TrainConfig(
+        name="rlt_pi05_geniesim_stack_three_blocks",
+        project_name="rlt-geniesim-stack-three-blocks",
+        exp_name="rlt_frozen_5k_seed42",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            discrete_state_input=True,
+        ),
+        data=GenieSimRolloutDataConfig(
+            repo_id="geniesim_stack_three_blocks_rollout",
+            rollout_root=GENIESIM_RLT_ROLLOUT_ROOT,
+            rollout_cache_root=GENIESIM_RLT_CACHE_ROOT,
+            assets=AssetsConfig(
+                assets_dir=GENIESIM_RLT_BASE_CKPT,
+                asset_id="assets",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{GENIESIM_RLT_BASE_CKPT}/params"),
+        assets_base_dir=f"{GENIESIM_RLT_RUN_ROOT}/assets",
+        checkpoint_base_dir=f"{GENIESIM_RLT_RUN_ROOT}/checkpoints",
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=5_000,
+        log_interval=20,
+        save_interval=1_000,
+        keep_period=5_000,
+        ema_decay=None,
+        wandb_enabled=False,
+        fsdp_devices=8,
+        policy_metadata={
+            "proprio_dim": 16,
+            "chunk_len": 50,
+            "action_dim": 16,
+            "delta_action_dims": 14,
+        },
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=0.0,
+    ),
+    TrainConfig(
+        name="rlt_pi05_geniesim_stack_three_blocks_plan",
+        project_name="rlt-geniesim-stack-three-blocks-reproduction",
+        exp_name="stage1_rl_token_20k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            discrete_state_input=True,
+        ),
+        data=GenieSimDemonstrationDataConfig(
+            repo_id="local/stack_three_blocks",
+            dataset_root=GENIESIM_RLT_DEMO_ROOT,
+            assets=AssetsConfig(assets_dir=GENIESIM_RLT_BASE_CKPT, asset_id="assets"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{GENIESIM_RLT_BASE_CKPT}/params"),
+        assets_base_dir=f"{GENIESIM_RLT_PLAN_ROOT}/assets",
+        checkpoint_base_dir=f"{GENIESIM_RLT_PLAN_ROOT}/checkpoints",
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=20_000,
+        log_interval=20,
+        save_interval=2_500,
+        keep_period=2_500,
+        ema_decay=None,
+        wandb_enabled=True,
+        fsdp_devices=8,
+        policy_metadata={
+            "proprio_dim": 16,
+            "chunk_len": 50,
+            "action_dim": 16,
+            "delta_action_dims": 14,
+            "stage1_source": "original_sft_demonstration_dataset",
+        },
         rlt_num_tokens=1,
         rlt_num_layers=2,
         rlt_embed_dim=2048,
